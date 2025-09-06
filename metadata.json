@@ -1,0 +1,6 @@
+{
+  "name": "Car Damage Visualizer",
+  "description": "Upload a photo of your car to visualize damage with AI-generated annotations and a repair preview.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
