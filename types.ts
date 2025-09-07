@@ -10,3 +10,14 @@ export interface RepairCost {
   costUSD: number;
   costRWF: number;
 }
+
+export interface VehicleInfo {
+    make: string;
+    model: string;
+    year: string;
+}
+
+export interface DamageAnalysis {
+    vehicle: VehicleInfo;
+    costs: RepairCost[];
+}

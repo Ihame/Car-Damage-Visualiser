@@ -3,222 +3,169 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
-import type { RepairCost } from '../types';
+import { GoogleGenAI, Modality, GenerateContentResponse } from "@google/genai";
+import type { DamageAnalysis } from '../types';
 
-// Helper function to convert a File object to a Gemini API Part
-const fileToPart = async (file: File): Promise<{ inlineData: { mimeType: string; data: string; } }> => {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = error => reject(error);
-    });
-    
-    const arr = dataUrl.split(',');
-    if (arr.length < 2) throw new Error("Invalid data URL");
-    const mimeMatch = arr[0].match(/:(.*?);/);
-    if (!mimeMatch || !mimeMatch[1]) throw new Error("Could not parse MIME type from data URL");
-    
-    const mimeType = mimeMatch[1];
-    const data = arr[1];
-    return { inlineData: { mimeType, data } };
-};
+// Initialize the Google AI client.
+// The API key is automatically sourced from the `process.env.API_KEY` environment variable.
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
 
-const parseCostData = (text: string): RepairCost[] => {
-    try {
-        // Find the JSON block within the text, which might be wrapped in markdown backticks.
-        const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/);
-        
-        let jsonString: string;
-        
-        if (jsonMatch && jsonMatch[1]) {
-            // If we found a markdown block, use its content.
-            jsonString = jsonMatch[1];
-        } else {
-            // If no markdown block is found, assume the whole text is the JSON.
-            // This is a fallback for cases where the model returns raw JSON.
-            jsonString = text.trim();
-        }
-
-        const data = JSON.parse(jsonString);
-
-        // Basic validation
-        if (!Array.isArray(data)) {
-            throw new Error("Parsed JSON is not an array.");
-        }
-        if (data.length > 0 && !data.every(item => 'part' in item && 'damage' in item && 'suggestion' in item && 'costUSD' in item && 'costRWF' in item)) {
-            throw new Error("Parsed JSON does not match expected format.");
-        }
-        return data as RepairCost[];
-    } catch (e) {
-        console.error("Failed to parse cost data JSON:", e, "Raw text:", text);
-        throw new Error(`The AI returned an invalid format for the cost estimation. Raw response: "${text}"`);
-    }
+// Helper function to convert a File object to a Part object for the Gemini API.
+async function fileToGenerativePart(file: File) {
+  const base64EncodedDataPromise = new Promise<string>((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
+    reader.readAsDataURL(file);
+  });
+  return {
+    inlineData: {
+      data: await base64EncodedDataPromise,
+      mimeType: file.type,
+    },
+  };
 }
 
-const handleImageOnlyApiResponse = (
-    response: GenerateContentResponse,
-    context: string // e.g., "repair"
-): string => {
-    // 1. Check for prompt blocking first
-    if (response.promptFeedback?.blockReason) {
-        const { blockReason, blockReasonMessage } = response.promptFeedback;
-        const errorMessage = `Request was blocked. Reason: ${blockReason}. ${blockReasonMessage || ''}`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
-    }
-
-    // 2. Try to find the image part
-    const imagePartFromResponse = response.candidates?.[0]?.content?.parts?.find(part => part.inlineData);
-
-    if (imagePartFromResponse?.inlineData) {
-        const { mimeType, data } = imagePartFromResponse.inlineData;
-        console.log(`Received image data (${mimeType}) for ${context}`);
-        return `data:${mimeType};base64,${data}`;
-    }
-
-    // 3. If no image, check for other reasons
-    const finishReason = response.candidates?.[0]?.finishReason;
-    if (finishReason && finishReason !== 'STOP') {
-        const errorMessage = `Image generation for ${context} stopped unexpectedly. Reason: ${finishReason}. This often relates to safety settings.`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
-    }
-    
-    const textFeedback = response.text?.trim();
-    const errorMessage = `The AI model did not return an image for the ${context}. ` + 
-        (textFeedback 
-            ? `The model responded with text: "${textFeedback}"`
-            : "This can happen due to safety filters or if the request is too complex. Please try rephrasing your prompt to be more direct.");
-
-    console.error(`Model response did not contain an image part for ${context}.`, { response });
-    throw new Error(errorMessage);
-};
-
-
 /**
- * Generates an image with damage annotations and provides a cost estimate.
- * @param originalImage The original image file of the car.
- * @param userDescription The user's description of the damage.
- * @returns A promise that resolves to an object containing the annotated image data URL and the cost data.
+ * Generates a damage analysis report and an annotated image.
+ * @param imageFile The image of the vehicle.
+ * @param description A user-provided description of the vehicle or incident.
+ * @param language The target language for the analysis ('en' or 'sw').
+ * @returns A promise that resolves to an object containing the annotated image URL and the structured analysis data.
  */
-export const generateDamageAnalysis = async (
-    originalImage: File,
-    userDescription: string
-): Promise<{ annotatedImage: string; costData: RepairCost[] }> => {
-    console.log('Starting damage analysis generation...');
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert auto-body visual assistant.
-Task: Analyze the uploaded car photo and user description. You MUST return two separate parts in your response: an edited image AND a JSON object.
+export async function generateDamageAnalysis(
+    imageFile: File,
+    description: string,
+    language: string,
+): Promise<{ annotatedImage: string; analysis: DamageAnalysis; }> {
+  const model = 'gemini-2.5-flash-image-preview';
+  const imagePart = await fileToGenerativePart(imageFile);
+  const targetLanguage = language === 'sw' ? 'Swahili' : 'English';
 
-1.  **Edited Image Part**:
-    -   Take the uploaded car photo and create an EDITED IMAGE that overlays damage areas.
-    -   Detect and highlight: dents, scratches, cracked lights, bumper or panel misalignment, chipped paint, rust.
-    -   Add semi-transparent RED overlays only where damage likely exists. Keep everything else identical.
-    -   Do NOT remove plates, beautify, or change the background. Keep scale, perspective, reflections, and lighting untouched.
-    -   If a user description is provided, prioritize those areas. User description: "${userDescription || 'none'}"
+  const prompt = `
+    As an expert AI vehicle damage assessor, your task is to analyze the provided image and vehicle description ("${description}").
 
-2.  **JSON Text Part**:
-    -   Provide a JSON array detailing the estimated repair costs for the damage you identified.
-    -   Based on the severity of the damage, provide a 'suggestion' for each item, which must be either 'Repair' or 'Replace'.
-    -   Base your cost estimates on standard US auto repair industry data.
-    -   For RWF, use an approximate conversion rate of 1 USD = 1300 RWF.
-    -   The JSON object must follow this exact schema:
-    \`\`\`json
-    [
-      {
-        "part": "string",
-        "damage": "string",
-        "suggestion": "string (either 'Repair' or 'Replace')",
-        "costUSD": number,
-        "costRWF": number
+    **Strict Output Requirements:** You MUST return exactly two items in your response:
+    1.  An **edited image** that annotates the damage.
+    2.  A single, valid **JSON object** with the damage analysis.
+
+    ---
+
+    **Image Task Details:**
+    - On a new version of the input image, draw circles around all detected areas of damage.
+    - **Inside or next to each circle, add a clear text label in ENGLISH** identifying the specific part (e.g., "Front Bumper", "Left Headlight"). The labels must be legible.
+
+    ---
+
+    **JSON Task Details:**
+    - Provide a single, raw JSON object (no markdown) with the following structure:
+        {
+          "vehicle": {
+            "make": "VEHICLE_MAKE",
+            "model": "VEHICLE_MODEL",
+            "year": "VEHICLE_YEAR"
+          },
+          "costs": [
+            {
+              "part": "DAMAGED_PART_NAME",
+              "damage": "BRIEF_DAMAGE_DESCRIPTION",
+              "suggestion": "Repair or Replace",
+              "costUSD": ESTIMATED_COST_IN_USD_AS_NUMBER,
+              "costRWF": ESTIMATED_COST_IN_RWF_AS_NUMBER
+            }
+          ]
+        }
+    - **Language**: All string values in the JSON ('part', 'damage', 'suggestion') MUST be professionally translated into ${targetLanguage}.
+    - **Content**:
+      - The 'part' name in the JSON must be the translated version of the English label from the image.
+      - Identify the vehicle's make, model, and year (in English) under the "vehicle" key.
+      - For each part, describe the damage, suggest "Repair" or "Replace".
+    - **Costs**:
+      - Estimate costs based on OEM parts and average East African labor rates.
+      - Use an exchange rate of 1 USD = 1300 RWF.
+      - All cost values must be numbers (e.g., 500, not "500").
+  `;
+
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: model,
+    contents: {
+      parts: [imagePart, { text: prompt }],
+    },
+    config: {
+      responseModalities: [Modality.IMAGE, Modality.TEXT],
+    },
+  });
+
+  let annotatedImage: string | null = null;
+  let analysis: DamageAnalysis | null = null;
+
+  if (response.candidates && response.candidates.length > 0) {
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData) {
+        const { data, mimeType } = part.inlineData;
+        annotatedImage = `data:${mimeType};base64,${data}`;
+      } else if (part.text) {
+        try {
+          const cleanedText = part.text.replace(/```json/g, '').replace(/```/g, '').trim();
+          analysis = JSON.parse(cleanedText) as DamageAnalysis;
+        } catch (e) {
+          console.error("Failed to parse JSON from model response:", part.text, e);
+          const jsonMatch = part.text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            try {
+              analysis = JSON.parse(jsonMatch[0]) as DamageAnalysis;
+            } catch (e2) {
+              console.error("Failed to parse extracted JSON from model response:", jsonMatch[0], e2);
+            }
+          }
+        }
       }
-    ]
-    \`\`\`
-    -   If no damage is detected, return an empty array [].
-
-Return BOTH the edited image part and the text part containing only the JSON.`;
-    const textPart = { text: prompt };
-
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-        config: {
-            responseModalities: [Modality.IMAGE, Modality.TEXT],
-        },
-    });
-    
-    // New response handling logic for multi-part responses
-    if (response.promptFeedback?.blockReason) {
-        const { blockReason, blockReasonMessage } = response.promptFeedback;
-        const errorMessage = `Request was blocked. Reason: ${blockReason}. ${blockReasonMessage || ''}`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
     }
+  }
 
-    const parts = response.candidates?.[0]?.content?.parts;
-    if (!parts || parts.length === 0) {
-        const finishReason = response.candidates?.[0]?.finishReason;
-        const reasonText = finishReason && finishReason !== 'STOP' ? `Reason: ${finishReason}.` : "The model's response was incomplete.";
-        const textFeedback = response.text?.trim();
-        const errorMessage = `The AI model did not return both an image and a cost estimate. ${reasonText} ${textFeedback ? `The model responded with: "${textFeedback}"` : ""}`;
-        console.error(errorMessage, { response });
-        throw new Error(errorMessage);
-    }
+  if (!annotatedImage || !analysis) {
+    throw new Error('The AI model did not return the expected annotated image and analysis data. Please try again.');
+  }
 
-    const imagePart = parts.find(part => part.inlineData);
-    const textPartResponse = parts.find(part => part.text);
-
-    if (!imagePart?.inlineData) {
-        throw new Error("The AI model did not return an image for the annotation.");
-    }
-    if (!textPartResponse?.text) {
-        throw new Error("The AI model did not return a cost estimate.");
-    }
-
-    const annotatedImage = `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
-    const costData = parseCostData(textPartResponse.text);
-
-    return { annotatedImage, costData };
-};
-
+  return { annotatedImage, analysis };
+}
 
 /**
- * Generates a preview of the repaired car.
- * @param originalImage The original image file of the car.
- * @param userDescription The user's description of the damage to repair.
- * @returns A promise that resolves to the data URL of the repaired image.
+ * Generates a photorealistic preview of the repaired vehicle.
+ * @param imageFile The image of the damaged vehicle.
+ * @param description A user-provided description of the vehicle.
+ * @returns A promise that resolves to a data URL for the repaired image.
  */
-export const generateRepairedPreview = async (
-    originalImage: File,
-    userDescription: string
-): Promise<string> => {
-    console.log('Starting repaired preview generation...');
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY! });
-    
-    const originalImagePart = await fileToPart(originalImage);
-    const prompt = `You are an expert auto-body visual assistant.
-Task: Create a “repaired” version of the SAME uploaded photo, using the user's description as a guide for what to fix.
+export async function generateRepairedPreview(imageFile: File, description: string): Promise<string> {
+  const model = 'gemini-2.5-flash-image-preview';
+  const imagePart = await fileToGenerativePart(imageFile);
 
-User Description of Damage: "${userDescription || 'none'}"
+  const prompt = `
+    You are an expert digital artist specializing in photorealistic vehicle restoration.
+    Based on the provided image and description ("${description}"), your task is to generate a new image showing the vehicle fully repaired.
+    - Restore it to a pristine, factory-new condition.
+    - Remove all dents, scratches, cracks, and any other damage.
+    - Ensure lighting, reflections, and textures are consistent with the original image for a realistic result.
+    - Your main output must be the final, edited image. Do not add any text to the image itself.
+  `;
 
-Instructions:
-- Remove scratches, fill dents, realign bumper/panels, restore paint to factory look, fix cracked lights based on the original image and user description.
-- KEEP the same car model, color, reflections, background, camera angle, and lighting.
-- Do not add stickers, text, watermarks, or color grading. 
-- Do not invent new rims/parts; preserve all identity features.
-- The repair should be subtle and realistic. No showroom gloss.
+  const response: GenerateContentResponse = await ai.models.generateContent({
+    model: model,
+    contents: {
+      parts: [imagePart, { text: prompt }],
+    },
+    config: {
+      responseModalities: [Modality.IMAGE, Modality.TEXT],
+    },
+  });
 
-Return: ONLY the edited image (after-repair preview). Do not return text.`;
-    const textPart = { text: prompt };
-
-    const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image-preview',
-        contents: { parts: [originalImagePart, textPart] },
-    });
-    
-    return handleImageOnlyApiResponse(response, 'repair');
-};
+  if (response.candidates && response.candidates.length > 0) {
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData) {
+        const { data, mimeType } = part.inlineData;
+        return `data:${mimeType};base64,${data}`;
+      }
+    }
+  }
+  
+  throw new Error('The AI model did not return a repaired image preview. Please try again.');
+}
